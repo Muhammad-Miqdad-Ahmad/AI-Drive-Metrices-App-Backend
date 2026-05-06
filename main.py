@@ -76,7 +76,7 @@ async def lifespan(app: FastAPI):
         state.is_xgb = meta.get("best_name") == "XGBoost"
     else:
         try:
-            from xgboost import XGBClassifier
+            from xgboost import XGBClassifier # type: ignore
             state.is_xgb = isinstance(state.model, XGBClassifier)
         except ImportError:
             state.is_xgb = False
