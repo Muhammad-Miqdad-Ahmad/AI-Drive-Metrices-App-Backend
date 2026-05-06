@@ -3,14 +3,15 @@
 #  POST /predict  ← ESP32 sends a 28-sample window of 6-axis IMU data
 #  Returns: class_id, class_name, confidence, all_probs
 #
-#  Place driver_behaviour_model.pkl and scaler.pkl in the same directory.
+#  Place driver_behaviour_model.pkl, scaler.pkl, and model_meta.json
+#  in the same directory.
 #  Run: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 # ═══════════════════════════════════════════════════════════════════════════
 
-import os
+import json
 import logging
+import os
 from contextlib import asynccontextmanager
-from typing import Optional
 
 import joblib
 import numpy as np
@@ -23,9 +24,13 @@ from pydantic import BaseModel, Field, model_validator
 
 MODEL_PATH  = os.getenv("MODEL_PATH",  "driver_behaviour_model.pkl")
 SCALER_PATH = os.getenv("SCALER_PATH", "scaler.pkl")
+META_PATH   = os.getenv("META_PATH",   "model_meta.json")
 
 WINDOW_SIZE = 28   # must match notebook
-SENSOR_COLS = ["AccX", "AccY", "AccZ", "GyroX", "GyroY", "GyroZ"]
+
+# !! CRITICAL: column order MUST match the notebook's FEATURES list !!
+# Notebook: FEATURES = ['GyroX', 'GyroY', 'GyroZ', 'AccX', 'AccY', 'AccZ']
+SENSOR_COLS = ["GyroX", "GyroY", "GyroZ", "AccX", "AccY", "AccZ"]
 
 CLASS_NAMES = {
     1: "Sudden Acceleration",
@@ -43,9 +48,9 @@ log = logging.getLogger("drivesense")
 # ─── MODEL STATE ─────────────────────────────────────────────────────────────
 
 class ModelState:
-    model       = None
-    scaler      = None
-    is_linear   = False   # True → apply StandardScaler before predict
+    model     = None
+    scaler    = None
+    is_xgb    = False   # True → model was trained on 0-indexed labels (0-3)
 
 state = ModelState()
 
@@ -53,38 +58,42 @@ state = ModelState()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # ── Load on startup ──────────────────────────────────────────────────
-    if not os.path.exists(MODEL_PATH):
-        raise FileNotFoundError(
-            f"Model file not found: {MODEL_PATH}\n"
-            "Run the notebook to generate driver_behaviour_model.pkl first."
-        )
-    if not os.path.exists(SCALER_PATH):
-        raise FileNotFoundError(
-            f"Scaler file not found: {SCALER_PATH}\n"
-            "Run the notebook to generate scaler.pkl first."
-        )
+    for path in (MODEL_PATH, SCALER_PATH):
+        if not os.path.exists(path):
+            raise FileNotFoundError(
+                f"Required file not found: {path}\n"
+                "Run the notebook to generate the artefacts first."
+            )
 
     state.model  = joblib.load(MODEL_PATH)
     state.scaler = joblib.load(SCALER_PATH)
 
-    # Detect if it's a linear model that needs scaling
-    model_type = type(state.model).__name__
-    state.is_linear = model_type in ("LogisticRegression", "SVC", "LinearSVC")
+    # Detect XGBoost via model_meta.json (written by notebook cell 6).
+    # Fall back to isinstance check if the file is absent.
+    if os.path.exists(META_PATH):
+        with open(META_PATH) as f:
+            meta = json.load(f)
+        state.is_xgb = meta.get("best_name") == "XGBoost"
+    else:
+        try:
+            from xgboost import XGBClassifier
+            state.is_xgb = isinstance(state.model, XGBClassifier)
+        except ImportError:
+            state.is_xgb = False
 
+    model_type = type(state.model).__name__
     log.info(f"Model loaded  : {MODEL_PATH}  ({model_type})")
     log.info(f"Scaler loaded : {SCALER_PATH}")
-    log.info(f"Scaling needed: {state.is_linear}")
+    log.info(f"XGBoost model : {state.is_xgb}  (0-indexed labels → +1 shift)")
     log.info("DriveSense backend ready.")
     yield
-    # cleanup (none needed)
 
 # ─── APP ─────────────────────────────────────────────────────────────────────
 
 app = FastAPI(
     title="DriveSense",
     description="Driving behaviour detection via IMU window classification",
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -131,33 +140,44 @@ class PredictResponse(BaseModel):
     all_probs:  dict[str, float]
 
 # ─── FEATURE ENGINEERING ─────────────────────────────────────────────────────
-# Exact replica of the notebook's extract_window_features() function.
-# DO NOT change the feature order — it must match the training feature order.
+# Exact replica of the notebook's window_features() function.
+#
+# Per-column features (9 each × 6 columns = 54 total):
+#   mean, std, min, max, range, rms, zero_crossing_rate, p25, p75
+#
+# Column order mirrors the notebook's FEATURES list:
+#   ['GyroX', 'GyroY', 'GyroZ', 'AccX', 'AccY', 'AccZ']
+#
+# DO NOT change either the feature set or column order — both must match
+# exactly what the model was trained on.
+
+def _zero_crossing_rate(x: np.ndarray) -> float:
+    """Fraction of consecutive sign-changes in a 1-D signal."""
+    return float(np.mean(np.diff(np.sign(x)) != 0))
+
 
 def extract_window_features(window_df: pd.DataFrame) -> np.ndarray:
     """
     Given a DataFrame with columns matching SENSOR_COLS and exactly WINDOW_SIZE
-    rows, extract the same 66 statistical features the notebook uses.
-    Returns a (1, 66) numpy array ready for model.predict().
+    rows, extract the same 54 statistical features the notebook uses.
+    Returns a (1, 54) numpy array ready for scaler.transform() → model.predict().
     """
-    feats: dict[str, float] = {}
+    feats: list[float] = []
 
-    for col in SENSOR_COLS:
-        vals = window_df[col].values.astype(np.float64)
+    for col in SENSOR_COLS:          # order is critical
+        s = window_df[col].values.astype(np.float64)
 
-        feats[f"{col}_mean"]   = float(np.mean(vals))
-        feats[f"{col}_std"]    = float(np.std(vals))
-        feats[f"{col}_min"]    = float(np.min(vals))
-        feats[f"{col}_max"]    = float(np.max(vals))
-        feats[f"{col}_range"]  = float(np.max(vals) - np.min(vals))
-        feats[f"{col}_median"] = float(np.median(vals))
-        feats[f"{col}_iqr"]    = float(np.percentile(vals, 75) - np.percentile(vals, 25))
-        feats[f"{col}_rms"]    = float(np.sqrt(np.mean(vals ** 2)))
-        feats[f"{col}_energy"] = float(np.sum(vals ** 2))
-        feats[f"{col}_skew"]   = float(pd.Series(vals).skew())
-        feats[f"{col}_kurt"]   = float(pd.Series(vals).kurtosis())
+        feats.append(float(s.mean()))
+        feats.append(float(s.std()))
+        feats.append(float(s.min()))
+        feats.append(float(s.max()))
+        feats.append(float(s.max() - s.min()))           # range
+        feats.append(float(np.sqrt(np.mean(s ** 2))))    # RMS
+        feats.append(_zero_crossing_rate(s))             # ZCR
+        feats.append(float(np.percentile(s, 25)))        # p25
+        feats.append(float(np.percentile(s, 75)))        # p75
 
-    return np.array(list(feats.values()), dtype=np.float64).reshape(1, -1)
+    return np.array(feats, dtype=np.float64).reshape(1, -1)  # (1, 54)
 
 # ─── ROUTES ──────────────────────────────────────────────────────────────────
 
@@ -167,6 +187,7 @@ async def root():
         "status":  "ok",
         "service": "DriveSense",
         "model":   type(state.model).__name__ if state.model else "not loaded",
+        "is_xgb":  state.is_xgb,
     }
 
 
@@ -182,24 +203,33 @@ async def predict(req: PredictRequest):
     # ── Build DataFrame ───────────────────────────────────────────────────
     rows = [
         {
-            "AccX":  r.AccX,  "AccY":  r.AccY,  "AccZ":  r.AccZ,
             "GyroX": r.GyroX, "GyroY": r.GyroY, "GyroZ": r.GyroZ,
+            "AccX":  r.AccX,  "AccY":  r.AccY,  "AccZ":  r.AccZ,
         }
         for r in req.window
     ]
     window_df = pd.DataFrame(rows)
 
-    # ── Extract features ──────────────────────────────────────────────────
-    X_live = extract_window_features(window_df)
-
-    if state.is_linear:
-        X_live = state.scaler.transform(X_live)
+    # ── Extract features & scale ──────────────────────────────────────────
+    # The scaler is ALWAYS applied: the model was fitted on scaled data
+    # regardless of model type (notebook always calls scaler.transform).
+    X_live = extract_window_features(window_df)       # (1, 54)
+    X_live = state.scaler.transform(X_live)
 
     # ── Predict ───────────────────────────────────────────────────────────
-    pred_enc  = int(state.model.predict(X_live)[0])          # 0-indexed
-    proba     = state.model.predict_proba(X_live)[0]         # shape (4,)
-    class_id  = pred_enc + 1                                  # back to 1-indexed
-    confidence = float(proba[pred_enc]) * 100.0
+    raw_pred  = int(state.model.predict(X_live)[0])
+    proba     = state.model.predict_proba(X_live)[0]  # shape (4,)
+
+    # XGBoost was trained on 0-indexed labels (0-3) → shift back to 1-4.
+    # All other models were trained on 1-4 → raw_pred IS already the class id.
+    if state.is_xgb:
+        class_id   = raw_pred + 1
+        proba_idx  = raw_pred           # 0-based index into proba array
+    else:
+        class_id   = raw_pred
+        proba_idx  = raw_pred - 1       # 1-based → 0-based for proba lookup
+
+    confidence = float(proba[proba_idx]) * 100.0
 
     all_probs = {
         CLASS_NAMES[i + 1]: round(float(p) * 100, 2)
