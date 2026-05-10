@@ -10,20 +10,17 @@
 #
 #  Run: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 #
-#  Fixed in this version vs old main.py:
-#   1. CLASS_NAMES now has 6 classes (0-5) matching combined_dataset.csv exactly
-#      OLD: 0=Normal Driving, 1=Sudden Accel … 4=Brake   (5 classes, wrong)
-#      NEW: 0=Idle State, 1=Normal Driving … 5=Sudden Brake (6 classes, correct)
-#   2. HARSH_CLASSES updated to {2,3,4,5} — labels 0 and 1 are both non-harsh
-#   3. Feature extraction fixed: 8 stats × 6 axes = 48 features
-#      OLD backend produced 54 features (had extra zero_crossing_rate)
-#      which caused a startup crash / feature mismatch with the trained model
-#   4. Feature stat order now matches notebook window_features() exactly:
-#      mean, std, min, max, Q1, Q3, RMS, range
-#   5. Model file renamed rf_model.pkl (matches joblib.dump in notebook)
-#   6. Startup sanity-check updated for 48 features and 6 classes
-#   7. GYRO_Y_BIAS removed — notebook already corrects GyroY at merge time;
-#      only GYRO_X_BIAS is needed at inference
+#  Changes in v4.1 vs v4.0:
+#   1. GYRO_Y_CORRECTION added (+1.527 deg/s)
+#      merge_datasets.py added +1.527 to GyroY in your self-collected data
+#      (labels 0 and 1) so it aligned with the original dataset's GyroY
+#      baseline (~4.13 deg/s). The same correction must be applied at
+#      inference time so the model sees the same GyroY range it was trained on.
+#      Without this: firmware sends GyroY 2.67, model trained on 4.13 → gap
+#      of 1.44 deg/s → Idle/Normal confidence stuck at ~44%.
+#      With this: 2.67 + 1.527 = 4.20 → matches training → ~80%+ confidence.
+#   2. /health and / endpoints now report gyro_y_correction value.
+#   3. All other logic unchanged from v4.0.
 # ═══════════════════════════════════════════════════════════════════════════
 
 import os
@@ -49,12 +46,12 @@ WINDOW_SIZE = 28   # must match notebook WINDOW_SIZE
 SENSOR_COLS = ["GyroX", "GyroY", "GyroZ", "AccX", "AccY", "AccZ"]
 
 # ── CLASS_NAMES must match combined_dataset.csv label scheme exactly ──────
-#   0 = Idle State          ← your self-collected data, label 0
-#   1 = Normal Driving      ← your self-collected data, label 1
-#   2 = Sudden Acceleration ← dataset.csv original label 1, remapped to 2
-#   3 = Sudden Right Turn   ← dataset.csv original label 2, remapped to 3
-#   4 = Sudden Left Turn    ← dataset.csv original label 3, remapped to 4
-#   5 = Sudden Brake        ← dataset.csv original label 4, remapped to 5
+#   0 = Idle State          <- your self-collected data, label 0
+#   1 = Normal Driving      <- your self-collected data, label 1
+#   2 = Sudden Acceleration <- dataset.csv original label 1, remapped to 2
+#   3 = Sudden Right Turn   <- dataset.csv original label 2, remapped to 3
+#   4 = Sudden Left Turn    <- dataset.csv original label 3, remapped to 4
+#   5 = Sudden Brake        <- dataset.csv original label 4, remapped to 5
 CLASS_NAMES = {
     0: "Idle State",
     1: "Normal Driving",
@@ -65,25 +62,40 @@ CLASS_NAMES = {
 }
 
 # Labels 0 and 1 are both non-harsh; 2-5 are harsh events
-HARSH_CLASSES = {2, 3, 4, 5}
+HARSH_CLASSES  = {2, 3, 4, 5}
 NORMAL_CLASSES = {0, 1}
 
 # When a harsh class is predicted but its confidence is below this threshold,
-# response falls back to Normal Driving.
+# the response falls back to Normal Driving (label 1).
 # Set to 0.0 to disable (always trust model). Recommended: 0.35 after validation.
 HARSH_THRESHOLD = float(os.getenv("HARSH_THRESHOLD", "0.0"))
 
-# Gyro X bias — subtract the DC idle offset measured from your ESP32.
-# Your idle.txt showed GyroX mean ≈ -2.58 °/s.
-# GyroY bias is NOT applied here — it was corrected at dataset-merge time
-# by merge_datasets.py and is already baked into the trained model.
-GYRO_X_BIAS = float(os.getenv("GYRO_X_BIAS", "-2.58"))
+# ── Gyro corrections ─────────────────────────────────────────────────────────
+#
+# GYRO_X_BIAS (-2.58 deg/s)
+#   Static DC idle offset on GyroX measured from your sensor's idle.txt.
+#   Subtracted from every incoming GyroX value before feature extraction.
+#   Raw firmware GyroX ~ -2.75 deg/s at rest
+#   After correction  ~  -0.17 deg/s  -> matches training data baseline
+#   Override: export GYRO_X_BIAS=-2.58
+#
+# GYRO_Y_CORRECTION (+1.527 deg/s)
+#   merge_datasets.py added +1.527 to GyroY in your self-collected data
+#   so labels 0 and 1 aligned with the original dataset's GyroY baseline.
+#   The model was trained on the corrected values, so inference must apply
+#   the same addition to every incoming GyroY value.
+#   Raw firmware GyroY ~ 2.67 deg/s at rest
+#   After correction  ~  4.20 deg/s  -> matches training data baseline (4.13)
+#   Override: export GYRO_Y_CORRECTION=1.527
+#
+GYRO_X_BIAS       = float(os.getenv("GYRO_X_BIAS",       "-2.58"))
+GYRO_Y_CORRECTION = float(os.getenv("GYRO_Y_CORRECTION", "1.527"))
 
 # Number of statistical features per axis — must match notebook window_features()
-# Notebook computes: mean, std, min, max, Q1, Q3, RMS, range  →  8 stats
-N_STATS   = 8
-N_SENSORS = len(SENSOR_COLS)           # 6
-N_FEATURES = N_STATS * N_SENSORS       # 48  ← must match model's n_features_in_
+# Notebook computes: mean, std, min, max, Q1, Q3, RMS, range  ->  8 stats
+N_STATS    = 8
+N_SENSORS  = len(SENSOR_COLS)       # 6
+N_FEATURES = N_STATS * N_SENSORS    # 48  <- must match model's n_features_in_
 
 logging.basicConfig(
     level=logging.INFO,
@@ -146,22 +158,23 @@ async def lifespan(app: FastAPI):
         raise ValueError(
             f"Feature count mismatch:\n"
             f"  Backend produces : {N_FEATURES} features  "
-            f"({N_STATS} stats × {N_SENSORS} axes)\n"
+            f"({N_STATS} stats x {N_SENSORS} axes)\n"
             f"  Model expects    : {model_features} features\n"
             f"Ensure extract_window_features() uses the same 8 stats as "
             f"the notebook window_features():\n"
             f"  mean, std, min, max, Q1, Q3, RMS, range"
         )
 
-    log.info(f"Model          : {MODEL_PATH}  ({model_type})")
-    log.info(f"Classes        : {original_labels}  → {[CLASS_NAMES[l] for l in original_labels]}")
-    log.info(f"Features       : {N_FEATURES}  ({N_STATS} stats × {N_SENSORS} axes)")
-    log.info(f"Harsh classes  : {sorted(HARSH_CLASSES)}")
-    log.info(f"Normal classes : {sorted(NORMAL_CLASSES)}")
-    log.info(f"Harsh threshold: {HARSH_THRESHOLD}  "
+    log.info(f"Model            : {MODEL_PATH}  ({model_type})")
+    log.info(f"Classes          : {original_labels}  -> {[CLASS_NAMES[l] for l in original_labels]}")
+    log.info(f"Features         : {N_FEATURES}  ({N_STATS} stats x {N_SENSORS} axes)")
+    log.info(f"Harsh classes    : {sorted(HARSH_CLASSES)}")
+    log.info(f"Normal classes   : {sorted(NORMAL_CLASSES)}")
+    log.info(f"Harsh threshold  : {HARSH_THRESHOLD}  "
              f"({'disabled' if HARSH_THRESHOLD == 0 else f'active at {HARSH_THRESHOLD:.0%}'})")
-    log.info(f"Gyro X bias    : {GYRO_X_BIAS} deg/s")
-    log.info("DriveSense backend ready.")
+    log.info(f"Gyro X bias      : {GYRO_X_BIAS} deg/s  (subtracted from raw GyroX)")
+    log.info(f"Gyro Y correction: +{GYRO_Y_CORRECTION} deg/s  (added to raw GyroY)")
+    log.info("DriveSense v4.1 backend ready.")
     yield
 
 # ─── APP ─────────────────────────────────────────────────────────────────────
@@ -169,7 +182,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="DriveSense",
     description="Driving behaviour detection via IMU window classification",
-    version="4.0.0",
+    version="4.1.0",
     lifespan=lifespan,
 )
 
@@ -183,8 +196,8 @@ app.add_middleware(
 # ─── SCHEMAS ─────────────────────────────────────────────────────────────────
 
 class SensorReading(BaseModel):
-    GyroX: float = Field(..., description="Gyroscope X  (deg/s)")
-    GyroY: float = Field(..., description="Gyroscope Y  (deg/s)")
+    GyroX: float = Field(..., description="Gyroscope X  (deg/s)  — raw, no bias removed")
+    GyroY: float = Field(..., description="Gyroscope Y  (deg/s)  — raw, no correction applied")
     GyroZ: float = Field(..., description="Gyroscope Z  (deg/s)")
     AccX:  float = Field(..., description="Acceleration X  (g)")
     AccY:  float = Field(..., description="Acceleration Y  (g)")
@@ -240,7 +253,7 @@ def extract_window_features(window_df: pd.DataFrame) -> np.ndarray:
         7. RMS (sqrt of mean of squares)
         8. range (max - min)
 
-    8 stats × 6 axes = 48 features total.
+    8 stats x 6 axes = 48 features total.
     Axis order follows SENSOR_COLS = [GyroX, GyroY, GyroZ, AccX, AccY, AccZ].
     """
     feats = []
@@ -265,6 +278,11 @@ def run_prediction(window_df: pd.DataFrame) -> PredictResponse:
     """
     Two-stage prediction pipeline.
 
+    Gyro corrections applied before feature extraction:
+      GyroX: subtract GYRO_X_BIAS      (-2.58 deg/s DC idle offset from sensor)
+      GyroY: add    GYRO_Y_CORRECTION  (+1.527 deg/s — mirrors the offset applied
+             by merge_datasets.py to training data labels 0 and 1)
+
     Stage 1 — Harsh vs Normal:
         Compute normal_prob = P(Idle) + P(Normal Driving).
         If predicted class is 0 or 1, return normal immediately.
@@ -277,11 +295,17 @@ def run_prediction(window_df: pd.DataFrame) -> PredictResponse:
     """
     window_df = window_df.copy()
 
-    # Apply Gyro X bias correction
-    # (GyroY was already corrected at merge time — do not apply again)
+    # ── Gyro corrections ─────────────────────────────────────────────────────
+    #
+    # GyroX: remove the sensor's static DC idle offset.
+    #   Raw ~ -2.75 deg/s  -->  corrected ~ -0.17 deg/s  (training baseline)
     window_df["GyroX"] = window_df["GyroX"] - GYRO_X_BIAS
 
-    # Guard: reject zero-variance windows (static/repeated data)
+    # GyroY: apply the same offset that merge_datasets.py baked into training data.
+    #   Raw ~ +2.67 deg/s  -->  corrected ~ +4.20 deg/s  (training baseline ~4.13)
+    window_df["GyroY"] = window_df["GyroY"] + GYRO_Y_CORRECTION
+
+    # ── Guard: reject zero-variance windows ──────────────────────────────────
     if window_df[SENSOR_COLS].std().max() < 1e-6:
         raise HTTPException(
             status_code=422,
@@ -291,11 +315,11 @@ def run_prediction(window_df: pd.DataFrame) -> PredictResponse:
             ),
         )
 
-    # Extract features and scale
-    X_live  = extract_window_features(window_df)
+    # ── Feature extraction and scaling ───────────────────────────────────────
+    X_live   = extract_window_features(window_df)
     X_scaled = state.scaler.transform(X_live)
 
-    # Model output
+    # ── Model output ─────────────────────────────────────────────────────────
     encoded_classes = list(state.model.classes_)
     proba           = state.model.predict_proba(X_scaled)[0]
     pred_enc        = int(state.model.predict(X_scaled)[0])
@@ -307,7 +331,7 @@ def run_prediction(window_df: pd.DataFrame) -> PredictResponse:
         orig_lbl = int(state.label_encoder.inverse_transform([enc])[0])
         all_probs[CLASS_NAMES[orig_lbl]] = round(float(proba[i]) * 100, 2)
 
-    # Stage 1 probabilities
+    # Stage 1: combined normal vs harsh probability
     normal_prob = round(
         all_probs.get("Idle State", 0.0) + all_probs.get("Normal Driving", 0.0),
         2,
@@ -356,14 +380,15 @@ async def root():
             orig = int(state.label_encoder.inverse_transform([enc])[0])
             model_classes.append(f"{orig}: {CLASS_NAMES[orig]}")
     return {
-        "status":          "ok",
-        "service":         "DriveSense",
-        "version":         "4.0.0",
-        "model":           type(state.model).__name__ if state.model else "not loaded",
-        "model_classes":   model_classes,
-        "harsh_classes":   sorted(HARSH_CLASSES),
-        "harsh_threshold": HARSH_THRESHOLD,
-        "gyro_x_bias":     GYRO_X_BIAS,
+        "status":            "ok",
+        "service":           "DriveSense",
+        "version":           "4.1.0",
+        "model":             type(state.model).__name__ if state.model else "not loaded",
+        "model_classes":     model_classes,
+        "harsh_classes":     sorted(HARSH_CLASSES),
+        "harsh_threshold":   HARSH_THRESHOLD,
+        "gyro_x_bias":       GYRO_X_BIAS,
+        "gyro_y_correction": GYRO_Y_CORRECTION,
     }
 
 
@@ -392,8 +417,8 @@ async def health():
     if state.model is None:
         raise HTTPException(503, "Model not loaded")
 
-    encoded  = list(state.model.classes_)
-    original = [int(state.label_encoder.inverse_transform([c])[0]) for c in encoded]
+    encoded   = list(state.model.classes_)
+    original  = [int(state.label_encoder.inverse_transform([c])[0]) for c in encoded]
     class_map = {o: CLASS_NAMES[o] for o in original}
 
     warnings = []
@@ -411,12 +436,13 @@ async def health():
         "n_classes":     len(class_map),
         "harsh_classes": sorted(HARSH_CLASSES),
         "config": {
-            "window_size":      WINDOW_SIZE,
-            "sensor_cols":      SENSOR_COLS,
-            "n_stats":          N_STATS,
-            "n_features":       N_FEATURES,
-            "gyro_x_bias":      GYRO_X_BIAS,
-            "harsh_threshold":  HARSH_THRESHOLD,
+            "window_size":       WINDOW_SIZE,
+            "sensor_cols":       SENSOR_COLS,
+            "n_stats":           N_STATS,
+            "n_features":        N_FEATURES,
+            "gyro_x_bias":       GYRO_X_BIAS,
+            "gyro_y_correction": GYRO_Y_CORRECTION,
+            "harsh_threshold":   HARSH_THRESHOLD,
         },
         "warnings": warnings,
     }
