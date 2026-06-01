@@ -1,18 +1,28 @@
 # ═══════════════════════════════════════════════════════════════════════════
 #  DriveSense Backend  |  FastAPI  |  Python 3.10+
-#  POST /predict  ← ESP32 sends a 28-sample window of 6-axis IMU data
+#  UART listener receives a 28-sample window of 6-axis IMU data from ESP32
 #  Returns: class_id, class_name, confidence, all_probs
 #
 #  Place driver_behaviour_model.pkl, scaler.pkl, and model_meta.json
 #  in the same directory.
-#  Run: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+#
+#  Run:
+#      uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+#
+#  UART notes:
+#      - Set SERIAL_PORT env var if auto-detection picks the wrong port.
+#      - ESP32 sends lines prefixed with "WINDOW:" followed by JSON.
+#      - Python replies with one JSON line and a trailing newline.
 # ═══════════════════════════════════════════════════════════════════════════
 
+import os
+import time
 import json
 import logging
-import os
+import threading
 from contextlib import asynccontextmanager
 
+import serial
 import joblib
 import numpy as np
 import pandas as pd
@@ -22,11 +32,17 @@ from pydantic import BaseModel, Field, model_validator
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
 
-MODEL_PATH  = os.getenv("MODEL_PATH",  "driver_behaviour_model.pkl")
+MODEL_PATH = os.getenv("MODEL_PATH", "driver_behaviour_model.pkl")
 SCALER_PATH = os.getenv("SCALER_PATH", "scaler.pkl")
-META_PATH   = os.getenv("META_PATH",   "model_meta.json")
+META_PATH = os.getenv("META_PATH", "model_meta.json")
 
 WINDOW_SIZE = 28   # must match notebook
+
+# UART config
+SERIAL_PORT = os.getenv("SERIAL_PORT", "").strip()  # e.g. COM3 or /dev/ttyUSB0
+SERIAL_BAUD = int(os.getenv("SERIAL_BAUD", "115200"))
+SERIAL_TIMEOUT = float(os.getenv("SERIAL_TIMEOUT", "1.0"))  # seconds
+SERIAL_AUTODETECT = os.getenv("SERIAL_AUTODETECT", "1").strip() != "0"
 
 # !! CRITICAL: column order MUST match the notebook's FEATURES list !!
 # Notebook: FEATURES = ['GyroX', 'GyroY', 'GyroZ', 'AccX', 'AccY', 'AccZ']
@@ -48,13 +64,186 @@ log = logging.getLogger("drivesense")
 # ─── MODEL STATE ─────────────────────────────────────────────────────────────
 
 class ModelState:
-    model     = None
-    scaler    = None
-    is_xgb    = False   # True → model was trained on 0-indexed labels (0-3)
+    model = None
+    scaler = None
+    is_xgb = False   # True → model was trained on 0-indexed labels (0-3)
+
+    serial_conn = None
+    serial_thread = None
+    serial_stop = None
+    serial_lock = None
 
 state = ModelState()
 
 # ─── LIFESPAN ────────────────────────────────────────────────────────────────
+
+def _pick_serial_port() -> str:
+    """
+    Pick a UART port. SERIAL_PORT env var wins.
+    Otherwise try to auto-detect a single candidate.
+    """
+    if SERIAL_PORT:
+        return SERIAL_PORT
+
+    if not SERIAL_AUTODETECT:
+        raise RuntimeError(
+            "SERIAL_PORT is not set and SERIAL_AUTODETECT=0. "
+            "Set SERIAL_PORT to your ESP32 port."
+        )
+
+    try:
+        from serial.tools import list_ports
+    except Exception as exc:
+        raise RuntimeError(
+            "pyserial is installed, but serial.tools.list_ports could not be imported."
+        ) from exc
+
+    ports = list(list_ports.comports())
+    if not ports:
+        raise RuntimeError("No serial ports found. Set SERIAL_PORT explicitly.")
+
+    # Prefer common USB/UART device names; otherwise fall back to the first port.
+    preferred = []
+    for p in ports:
+        dev = (p.device or "").lower()
+        desc = (p.description or "").lower()
+        hwid = (p.hwid or "").lower()
+        if any(tag in dev for tag in ("ttyusb", "ttyacm", "com")) or any(
+            tag in desc for tag in ("usb", "serial", "uart", "acm")
+        ) or "usb" in hwid:
+            preferred.append(p.device)
+
+    if len(preferred) == 1:
+        return preferred[0]
+    if len(ports) == 1:
+        return ports[0].device
+
+    # Ambiguous: choose the first one, but log the list so it is obvious.
+    log.warning(
+        "Multiple serial ports detected. Auto-selecting the first one: %s",
+        ports[0].device,
+    )
+    for p in ports:
+        log.info("Available port: %s | %s | %s", p.device, p.description, p.hwid)
+    return ports[0].device
+
+
+def _serial_write_line(conn: serial.Serial, payload: dict) -> None:
+    line = json.dumps(payload, separators=(",", ":")) + "\n"
+    conn.write(line.encode("utf-8"))
+    conn.flush()
+
+
+def _predict_from_window_rows(rows: list[dict]) -> dict:
+    if len(rows) != WINDOW_SIZE:
+        raise ValueError(f"window must contain exactly {WINDOW_SIZE} samples, got {len(rows)}")
+
+    window_df = pd.DataFrame(rows)
+
+    # ── Extract features & scale ──────────────────────────────────────────
+    # The scaler is ALWAYS applied: the model was fitted on scaled data
+    # regardless of model type (notebook always calls scaler.transform).
+    X_live = extract_window_features(window_df)       # (1, 54)
+    X_live = state.scaler.transform(X_live)
+
+    # ── Predict ───────────────────────────────────────────────────────────
+    raw_pred = int(state.model.predict(X_live)[0])
+    proba = state.model.predict_proba(X_live)[0]  # shape (4,)
+
+    # XGBoost was trained on 0-indexed labels (0-3) → shift back to 1-4.
+    # All other models were trained on 1-4 → raw_pred IS already the class id.
+    if state.is_xgb:
+        class_id = raw_pred + 1
+        proba_idx = raw_pred           # 0-based index into proba array
+    else:
+        class_id = raw_pred
+        proba_idx = raw_pred - 1       # 1-based → 0-based for proba lookup
+
+    confidence = float(proba[proba_idx]) * 100.0
+
+    all_probs = {
+        CLASS_NAMES[i + 1]: round(float(p) * 100, 2)
+        for i, p in enumerate(proba)
+    }
+
+    result = {
+        "class_id": class_id,
+        "class_name": CLASS_NAMES[class_id],
+        "confidence": round(confidence, 2),
+        "all_probs": all_probs,
+    }
+
+    log.info(
+        f"Prediction → [{class_id}] {CLASS_NAMES[class_id]}  "
+        f"({confidence:.1f}%)"
+    )
+    return result
+
+
+def _uart_loop() -> None:
+    conn = state.serial_conn
+    assert conn is not None
+
+    log.info("UART listener started on %s @ %d", conn.port, conn.baudrate)
+
+    while not state.serial_stop.is_set():
+        try:
+            raw = conn.readline()
+            if not raw:
+                continue
+
+            line = raw.decode("utf-8", errors="ignore").strip()
+            if not line:
+                continue
+
+            # Ignore debug chatter from the ESP32 unless it is an actual window.
+            if not line.startswith("WINDOW:"):
+                continue
+
+            payload = line[len("WINDOW:"):].strip()
+            if not payload:
+                log.warning("Received WINDOW prefix with empty payload.")
+                continue
+
+            try:
+                doc = json.loads(payload)
+            except json.JSONDecodeError as exc:
+                log.exception("Invalid JSON received over UART: %s", exc)
+                continue
+
+            rows = doc.get("window")
+            if not isinstance(rows, list):
+                log.warning("UART payload missing 'window' list.")
+                continue
+
+            try:
+                result = _predict_from_window_rows(rows)
+            except Exception as exc:
+                log.exception("Prediction failed: %s", exc)
+                # Keep the line-oriented protocol alive; send an explicit error JSON.
+                err = {
+                    "class_id": -1,
+                    "class_name": "Error",
+                    "confidence": 0.0,
+                    "all_probs": {},
+                    "error": str(exc),
+                }
+                _serial_write_line(conn, err)
+                continue
+
+            _serial_write_line(conn, result)
+
+        except (serial.SerialException, OSError) as exc:
+            if state.serial_stop.is_set():
+                break
+            log.exception("UART error: %s", exc)
+            time.sleep(1.0)
+        except Exception as exc:
+            log.exception("Unexpected UART loop error: %s", exc)
+            time.sleep(0.2)
+
+    log.info("UART listener stopped.")
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -65,7 +254,7 @@ async def lifespan(app: FastAPI):
                 "Run the notebook to generate the artefacts first."
             )
 
-    state.model  = joblib.load(MODEL_PATH)
+    state.model = joblib.load(MODEL_PATH)
     state.scaler = joblib.load(SCALER_PATH)
 
     # Detect XGBoost via model_meta.json (written by notebook cell 6).
@@ -76,7 +265,7 @@ async def lifespan(app: FastAPI):
         state.is_xgb = meta.get("best_name") == "XGBoost"
     else:
         try:
-            from xgboost import XGBClassifier # type: ignore
+            from xgboost import XGBClassifier  # type: ignore
             state.is_xgb = isinstance(state.model, XGBClassifier)
         except ImportError:
             state.is_xgb = False
@@ -85,8 +274,45 @@ async def lifespan(app: FastAPI):
     log.info(f"Model loaded  : {MODEL_PATH}  ({model_type})")
     log.info(f"Scaler loaded : {SCALER_PATH}")
     log.info(f"XGBoost model : {state.is_xgb}  (0-indexed labels → +1 shift)")
-    log.info("DriveSense backend ready.")
-    yield
+
+    state.serial_lock = threading.Lock()
+    state.serial_stop = threading.Event()
+
+    try:
+        port = _pick_serial_port()
+        state.serial_conn = serial.Serial(
+            port=port,
+            baudrate=SERIAL_BAUD,
+            timeout=SERIAL_TIMEOUT,
+            write_timeout=SERIAL_TIMEOUT,
+        )
+        # Give the ESP32 a moment after opening the port.
+        time.sleep(2.0)
+        log.info("Serial port opened: %s @ %d", port, SERIAL_BAUD)
+
+        state.serial_thread = threading.Thread(target=_uart_loop, daemon=True)
+        state.serial_thread.start()
+        log.info("DriveSense backend ready.")
+    except Exception as exc:
+        log.exception("Failed to start UART listener: %s", exc)
+        log.info("DriveSense backend is still up, but UART input is disabled.")
+
+    try:
+        yield
+    finally:
+        if state.serial_stop is not None:
+            state.serial_stop.set()
+
+        if state.serial_conn is not None:
+            try:
+                state.serial_conn.close()
+            except Exception:
+                pass
+            state.serial_conn = None
+
+        if state.serial_thread is not None and state.serial_thread.is_alive():
+            state.serial_thread.join(timeout=2.0)
+
 
 # ─── APP ─────────────────────────────────────────────────────────────────────
 
@@ -107,9 +333,9 @@ app.add_middleware(
 # ─── SCHEMAS ─────────────────────────────────────────────────────────────────
 
 class SensorReading(BaseModel):
-    AccX:  float = Field(..., description="Acceleration X  (m/s²)")
-    AccY:  float = Field(..., description="Acceleration Y  (m/s²)")
-    AccZ:  float = Field(..., description="Acceleration Z  (m/s²)")
+    AccX: float = Field(..., description="Acceleration X  (m/s²)")
+    AccY: float = Field(..., description="Acceleration Y  (m/s²)")
+    AccZ: float = Field(..., description="Acceleration Z  (m/s²)")
     GyroX: float = Field(..., description="Gyroscope X     (°/s)")
     GyroY: float = Field(..., description="Gyroscope Y     (°/s)")
     GyroZ: float = Field(..., description="Gyroscope Z     (°/s)")
@@ -134,10 +360,10 @@ class PredictRequest(BaseModel):
 
 
 class PredictResponse(BaseModel):
-    class_id:   int
+    class_id: int
     class_name: str
     confidence: float   # percent, 0–100
-    all_probs:  dict[str, float]
+    all_probs: dict[str, float]
 
 # ─── FEATURE ENGINEERING ─────────────────────────────────────────────────────
 # Exact replica of the notebook's window_features() function.
@@ -184,10 +410,11 @@ def extract_window_features(window_df: pd.DataFrame) -> np.ndarray:
 @app.get("/", summary="Health check")
 async def root():
     return {
-        "status":  "ok",
+        "status": "ok",
         "service": "DriveSense",
-        "model":   type(state.model).__name__ if state.model else "not loaded",
-        "is_xgb":  state.is_xgb,
+        "model": type(state.model).__name__ if state.model else "not loaded",
+        "is_xgb": state.is_xgb,
+        "uart_enabled": state.serial_conn is not None,
     }
 
 
@@ -200,54 +427,16 @@ async def predict(req: PredictRequest):
     if state.model is None:
         raise HTTPException(503, "Model not loaded")
 
-    # ── Build DataFrame ───────────────────────────────────────────────────
     rows = [
         {
             "GyroX": r.GyroX, "GyroY": r.GyroY, "GyroZ": r.GyroZ,
-            "AccX":  r.AccX,  "AccY":  r.AccY,  "AccZ":  r.AccZ,
+            "AccX": r.AccX, "AccY": r.AccY, "AccZ": r.AccZ,
         }
         for r in req.window
     ]
-    window_df = pd.DataFrame(rows)
 
-    # ── Extract features & scale ──────────────────────────────────────────
-    # The scaler is ALWAYS applied: the model was fitted on scaled data
-    # regardless of model type (notebook always calls scaler.transform).
-    X_live = extract_window_features(window_df)       # (1, 54)
-    X_live = state.scaler.transform(X_live)
-
-    # ── Predict ───────────────────────────────────────────────────────────
-    raw_pred  = int(state.model.predict(X_live)[0])
-    proba     = state.model.predict_proba(X_live)[0]  # shape (4,)
-
-    # XGBoost was trained on 0-indexed labels (0-3) → shift back to 1-4.
-    # All other models were trained on 1-4 → raw_pred IS already the class id.
-    if state.is_xgb:
-        class_id   = raw_pred + 1
-        proba_idx  = raw_pred           # 0-based index into proba array
-    else:
-        class_id   = raw_pred
-        proba_idx  = raw_pred - 1       # 1-based → 0-based for proba lookup
-
-    confidence = float(proba[proba_idx]) * 100.0
-
-    all_probs = {
-        CLASS_NAMES[i + 1]: round(float(p) * 100, 2)
-        for i, p in enumerate(proba)
-    }
-
-    result = PredictResponse(
-        class_id=class_id,
-        class_name=CLASS_NAMES[class_id],
-        confidence=round(confidence, 2),
-        all_probs=all_probs,
-    )
-
-    log.info(
-        f"Prediction → [{class_id}] {CLASS_NAMES[class_id]}  "
-        f"({confidence:.1f}%)"
-    )
-    return result
+    result = _predict_from_window_rows(rows)
+    return PredictResponse(**result)
 
 
 @app.post(
@@ -258,7 +447,7 @@ async def predict(req: PredictRequest):
 async def predict_raw(reading: SensorReading):
     """
     Convenience endpoint: takes one reading and inflates it to a WINDOW_SIZE
-    window. Useful for quick testing. Production should use /predict.
+    window. Useful for quick testing. Production should use UART.
     """
     fake_window_req = PredictRequest(window=[reading] * WINDOW_SIZE)
     return await predict(fake_window_req)
