@@ -3,6 +3,7 @@
 #
 #  Receives 28-sample IMU windows from ESP32 over USB-Serial (UART).
 #  Classifies driving behaviour with a RandomForest trained in the notebook.
+#  Logs every prediction + raw window to a CSV file for dataset building.
 #
 #  Artefacts required (same directory):
 #      rf_model.pkl        ← notebook cell 8
@@ -18,17 +19,23 @@
 #      e.g.  SERIAL_PORT=COM3 uvicorn main:app ...
 #            SERIAL_PORT=/dev/ttyUSB0 uvicorn main:app ...
 #
+#  CSV logging:
+#      Predictions are appended to live_data_log.csv (one row per window).
+#      Override path:  CSV_LOG_PATH=my_drive_session.csv uvicorn main:app ...
+#
 #  Protocol:
 #      ESP32 → PC : "WINDOW:<json>\n"
 #      PC → ESP32 : "<json>\n"
 # ═══════════════════════════════════════════════════════════════════════════
 
 import os
+import csv
 import time
 import json
 import logging
 import threading
 from contextlib import asynccontextmanager
+from datetime import datetime
 
 import serial
 import joblib
@@ -47,10 +54,13 @@ LE_PATH      = os.getenv("LE_PATH",      "label_encoder.pkl")
 WINDOW_SIZE = 28   # must match notebook
 
 # UART config
-SERIAL_PORT      = os.getenv("SERIAL_PORT", "").strip()
-SERIAL_BAUD      = int(os.getenv("SERIAL_BAUD", "115200"))
-SERIAL_TIMEOUT   = float(os.getenv("SERIAL_TIMEOUT", "1.0"))
+SERIAL_PORT       = os.getenv("SERIAL_PORT", "").strip()
+SERIAL_BAUD       = int(os.getenv("SERIAL_BAUD", "115200"))
+SERIAL_TIMEOUT    = float(os.getenv("SERIAL_TIMEOUT", "1.0"))
 SERIAL_AUTODETECT = os.getenv("SERIAL_AUTODETECT", "1").strip() != "0"
+
+# CSV logging
+CSV_LOG_PATH = os.getenv("CSV_LOG_PATH", "live_data_log.csv")
 
 # !! Column order MUST match notebook's FEATURES list !!
 # FEATURES = ['GyroX', 'GyroY', 'GyroZ', 'AccX', 'AccY', 'AccZ']
@@ -68,6 +78,20 @@ CLASS_NAMES = {
 
 HARSH_CLASSES = {2, 3, 4, 5}
 
+# CSV column layout:
+#   timestamp, window_index,
+#   GyroX_s0 … AccZ_s27   (168 raw sensor columns, 28 samples × 6 axes),
+#   class_id, class_name, confidence, is_harsh
+CSV_COLUMNS = [
+    "timestamp",
+    "window_index",
+    *[f"{col}_s{i}" for i in range(WINDOW_SIZE) for col in SENSOR_COLS],
+    "class_id",
+    "class_name",
+    "confidence",
+    "is_harsh",
+]
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -77,15 +101,50 @@ log = logging.getLogger("drivesense")
 # ─── MODEL STATE ─────────────────────────────────────────────────────────────
 
 class ModelState:
-    model         = None
-    scaler        = None
-    le            = None   # LabelEncoder — maps encoded index ↔ original class id
-    serial_conn   = None
-    serial_thread = None
-    serial_stop   = None
-    serial_lock   = None
+    model          = None
+    scaler         = None
+    le             = None   # LabelEncoder — maps encoded index ↔ original class id
+    serial_conn    = None
+    serial_thread  = None
+    serial_stop    = None
+    serial_lock    = None
+    window_counter = 0      # incremented on every successful prediction
 
 state = ModelState()
+
+# ─── CSV LOGGING ─────────────────────────────────────────────────────────────
+
+def _append_to_csv(rows: list[dict], result: dict) -> None:
+    """Append one row (full window + prediction) to the CSV log."""
+    state.window_counter += 1
+
+    file_exists = os.path.exists(CSV_LOG_PATH)
+
+    row: dict = {
+        "timestamp":    datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
+        "window_index": state.window_counter,
+    }
+
+    # Flatten all 28 samples → GyroX_s0, GyroY_s0, … AccZ_s27
+    for i, sample in enumerate(rows):
+        for col in SENSOR_COLS:
+            row[f"{col}_s{i}"] = sample[col]
+
+    row["class_id"]   = result["class_id"]
+    row["class_name"] = result["class_name"]
+    row["confidence"] = result["confidence"]
+    row["is_harsh"]   = result["is_harsh"]
+
+    try:
+        with open(CSV_LOG_PATH, "a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
+            if not file_exists:
+                writer.writeheader()
+                log.info("CSV log created : %s", CSV_LOG_PATH)
+            writer.writerow(row)
+    except OSError as exc:
+        log.error("CSV write failed: %s", exc)
+
 
 # ─── FEATURE ENGINEERING ─────────────────────────────────────────────────────
 # Exact replica of the notebook's window_features() — 8 stats × 6 axes = 48.
@@ -128,11 +187,11 @@ def _predict_from_rows(rows: list[dict]) -> dict:
     X_live    = extract_window_features(window_df)   # (1, 48)
     X_live    = state.scaler.transform(X_live)
 
-    raw_pred  = int(state.model.predict(X_live)[0])  # encoded label (0-5)
-    proba     = state.model.predict_proba(X_live)[0] # shape (6,)
+    raw_pred   = int(state.model.predict(X_live)[0])  # encoded label (0-5)
+    proba      = state.model.predict_proba(X_live)[0] # shape (6,)
 
     # Decode back to original class id via the notebook's LabelEncoder
-    class_id  = int(state.le.inverse_transform([raw_pred])[0])
+    class_id   = int(state.le.inverse_transform([raw_pred])[0])
     confidence = float(proba[raw_pred]) * 100.0
 
     all_probs = {
@@ -161,6 +220,9 @@ def _predict_from_rows(rows: list[dict]) -> dict:
     print(f"│  Harsh      : {'YES' if class_id in HARSH_CLASSES else 'NO':<22} │")
     print("└──────────────────────────────────────┘")
 
+    # ── Log to CSV ────────────────────────────────────────────────────────
+    _append_to_csv(rows, result)
+
     return result
 
 
@@ -187,7 +249,7 @@ def _pick_serial_port() -> str:
 
     preferred = [
         p.device for p in ports
-        if any(tag in (p.device or "").lower()   for tag in ("ttyusb", "ttyacm", "com"))
+        if any(tag in (p.device or "").lower()      for tag in ("ttyusb", "ttyacm", "com"))
         or any(tag in (p.description or "").lower() for tag in ("usb", "serial", "uart", "acm"))
         or "usb" in (p.hwid or "").lower()
     ]
@@ -285,6 +347,7 @@ async def lifespan(app: FastAPI):
     log.info("Model   loaded : %s  (%s)", MODEL_PATH,  type(state.model).__name__)
     log.info("Scaler  loaded : %s", SCALER_PATH)
     log.info("Encoder loaded : %s  classes=%s", LE_PATH, list(state.le.classes_))
+    log.info("CSV log path   : %s", os.path.abspath(CSV_LOG_PATH))
 
     state.serial_lock = threading.Lock()
     state.serial_stop = threading.Event()
@@ -318,6 +381,7 @@ async def lifespan(app: FastAPI):
                 pass
         if state.serial_thread and state.serial_thread.is_alive():
             state.serial_thread.join(timeout=2.0)
+        log.info("Logged %d windows to %s", state.window_counter, CSV_LOG_PATH)
 
 
 # ─── APP ─────────────────────────────────────────────────────────────────────
@@ -325,7 +389,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="DriveSense",
     description="Driving behaviour detection via IMU window classification (UART + HTTP)",
-    version="2.0.0",
+    version="2.1.0",
     lifespan=lifespan,
 )
 
@@ -378,11 +442,13 @@ class PredictResponse(BaseModel):
 @app.get("/", summary="Health check")
 async def root():
     return {
-        "status":       "ok",
-        "service":      "DriveSense",
-        "model":        type(state.model).__name__ if state.model else "not loaded",
-        "classes":      CLASS_NAMES,
-        "uart_enabled": state.serial_conn is not None and state.serial_conn.is_open,
+        "status":        "ok",
+        "service":       "DriveSense",
+        "model":         type(state.model).__name__ if state.model else "not loaded",
+        "classes":       CLASS_NAMES,
+        "uart_enabled":  state.serial_conn is not None and state.serial_conn.is_open,
+        "csv_log":       os.path.abspath(CSV_LOG_PATH),
+        "windows_logged": state.window_counter,
     }
 
 
@@ -409,3 +475,17 @@ async def predict(req: PredictRequest):
 async def predict_raw(reading: SensorReading):
     fake_req = PredictRequest(window=[reading] * WINDOW_SIZE)
     return await predict(fake_req)
+
+
+@app.get("/csv/stats", summary="How many windows have been logged this session")
+async def csv_stats():
+    rows_on_disk = 0
+    if os.path.exists(CSV_LOG_PATH):
+        with open(CSV_LOG_PATH, "r", encoding="utf-8") as f:
+            rows_on_disk = sum(1 for _ in f) - 1   # subtract header
+
+    return {
+        "csv_path":       os.path.abspath(CSV_LOG_PATH),
+        "windows_logged": state.window_counter,
+        "rows_on_disk":   max(rows_on_disk, 0),
+    }
