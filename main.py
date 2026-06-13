@@ -154,10 +154,21 @@ def _append_to_csv(rows: list[dict], result: dict) -> None:
 # DO NOT add or reorder features — the scaler and model were fitted on this
 # exact 48-element vector.
 
+GYRO_COLS = ["GyroX", "GyroY", "GyroZ"]   # mean-centered per window (see below)
+
+
 def extract_window_features(window_df: pd.DataFrame) -> np.ndarray:
     """
     Returns a (1, 48) numpy array ready for scaler.transform() → model.predict().
+
+    Gyro axes are mean-centered per window to strip the per-sensor DC bias
+    (a stationary gyro should read 0). This MUST match the notebook's
+    window_features(); accel keeps its DC component (gravity/tilt).
     """
+    window_df = window_df.copy()
+    window_df[GYRO_COLS] = window_df[GYRO_COLS].astype(np.float64)
+    window_df[GYRO_COLS] -= window_df[GYRO_COLS].mean()
+
     feats: list[float] = []
 
     for col in SENSOR_COLS:           # order is critical
