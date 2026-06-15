@@ -2,16 +2,17 @@
 #  DriveSense Backend  |  FastAPI + UART  |  Python 3.10+
 #
 #  Receives 28-sample IMU windows from ESP32 over USB-Serial (UART).
-#  Classifies driving behaviour with a RandomForest trained in the notebook.
+#  Classifies driving behaviour with a TFLite MLP trained in the notebook.
 #  Logs every prediction + raw window to a CSV file for dataset building.
 #
 #  Artefacts required (same directory):
-#      rf_model.pkl        ← notebook cell 8
-#      scaler.pkl          ← notebook cell 5
-#      label_encoder.pkl   ← notebook cell 5
+#      driver_behaviour_mlp.tflite  ← notebook cell 23
+#      scaler.pkl                   ← notebook cell 9
+#      label_encoder.pkl            ← notebook cell 9
 #
 #  Run:
-#      pip install fastapi uvicorn pyserial joblib numpy pandas scikit-learn
+#      pip install fastapi uvicorn pyserial joblib numpy pandas tflite-runtime
+#      (or: pip install tensorflow   -- provides tf.lite.Interpreter too)
 #      uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 #
 #  UART:
@@ -36,7 +37,6 @@ import logging
 import threading
 from contextlib import asynccontextmanager
 from datetime import datetime
-
 import serial
 import joblib
 import numpy as np
@@ -45,9 +45,19 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, model_validator
 
+# Prefer the lightweight tflite-runtime package if available, otherwise fall
+# back to the tf.lite.Interpreter shipped with full TensorFlow.
+try:
+    from tflite_runtime.interpreter import Interpreter as TFLiteInterpreter
+except ImportError:
+    try:
+        from ai_edge_litert.interpreter import Interpreter as TFLiteInterpreter
+    except ImportError:
+        from tensorflow.lite.python.interpreter import Interpreter as TFLiteInterpreter
+
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
 
-MODEL_PATH   = os.getenv("MODEL_PATH",   "rf_model.pkl")
+TFLITE_PATH  = os.getenv("TFLITE_PATH",  "driver_behaviour_mlp.tflite")
 SCALER_PATH  = os.getenv("SCALER_PATH",  "scaler.pkl")
 LE_PATH      = os.getenv("LE_PATH",      "label_encoder.pkl")
 
@@ -60,7 +70,7 @@ SERIAL_TIMEOUT    = float(os.getenv("SERIAL_TIMEOUT", "1.0"))
 SERIAL_AUTODETECT = os.getenv("SERIAL_AUTODETECT", "1").strip() != "0"
 
 # CSV logging
-CSV_LOG_PATH = os.getenv("CSV_LOG_PATH", "live_data_log.csv")
+CSV_LOG_PATH = os.getenv("CSV_LOG_PATH", "livedatalog.csv")
 
 # !! Column order MUST match notebook's FEATURES list !!
 # FEATURES = ['GyroX', 'GyroY', 'GyroZ', 'AccX', 'AccY', 'AccZ']
@@ -101,7 +111,9 @@ log = logging.getLogger("drivesense")
 # ─── MODEL STATE ─────────────────────────────────────────────────────────────
 
 class ModelState:
-    model          = None
+    interpreter    = None   # tf.lite.Interpreter
+    input_index    = None
+    output_index   = None
     scaler         = None
     le             = None   # LabelEncoder — maps encoded index ↔ original class id
     serial_conn    = None
@@ -159,7 +171,7 @@ GYRO_COLS = ["GyroX", "GyroY", "GyroZ"]   # mean-centered per window (see below)
 
 def extract_window_features(window_df: pd.DataFrame) -> np.ndarray:
     """
-    Returns a (1, 48) numpy array ready for scaler.transform() → model.predict().
+    Returns a (1, 48) numpy array ready for scaler.transform() → model inference.
 
     Gyro axes are mean-centered per window to strip the per-sensor DC bias
     (a stationary gyro should read 0). This MUST match the notebook's
@@ -186,6 +198,20 @@ def extract_window_features(window_df: pd.DataFrame) -> np.ndarray:
     return np.array(feats, dtype=np.float64).reshape(1, -1)   # (1, 48)
 
 
+# ─── TFLITE INFERENCE ────────────────────────────────────────────────────────
+
+def _run_tflite(X_live: np.ndarray) -> np.ndarray:
+    """
+    Run the TFLite MLP on a (1, 48) float32 array.
+    Returns the (6,) softmax probability vector (encoded-label order).
+    """
+    interp = state.interpreter
+    interp.set_tensor(state.input_index, X_live.astype(np.float32))
+    interp.invoke()
+    out = interp.get_tensor(state.output_index)
+    return out[0]  # shape (6,)
+
+
 # ─── PREDICTION (shared by UART loop and HTTP endpoint) ──────────────────────
 
 def _predict_from_rows(rows: list[dict]) -> dict:
@@ -196,10 +222,11 @@ def _predict_from_rows(rows: list[dict]) -> dict:
 
     window_df = pd.DataFrame(rows)
     X_live    = extract_window_features(window_df)   # (1, 48)
-    X_live    = state.scaler.transform(X_live)
+    X_live    = state.scaler.transform(X_live)        # (1, 48), float64
 
-    raw_pred   = int(state.model.predict(X_live)[0])  # encoded label (0-5)
-    proba      = state.model.predict_proba(X_live)[0] # shape (6,)
+    proba = _run_tflite(X_live)   # shape (6,), softmax output, encoded order
+
+    raw_pred = int(np.argmax(proba))   # encoded label (0-5)
 
     # Decode back to original class id via the notebook's LabelEncoder
     class_id   = int(state.le.inverse_transform([raw_pred])[0])
@@ -344,18 +371,24 @@ def _uart_loop() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Verify all three artefacts exist before loading
-    missing = [p for p in (MODEL_PATH, SCALER_PATH, LE_PATH) if not os.path.exists(p)]
+    missing = [p for p in (TFLITE_PATH, SCALER_PATH, LE_PATH) if not os.path.exists(p)]
     if missing:
         raise FileNotFoundError(
             f"Missing artefact(s): {missing}\n"
-            "Run the notebook (cells 5-8) to generate them first."
+            "Run the notebook (cells 9 & 23) to generate them first."
         )
 
-    state.model  = joblib.load(MODEL_PATH)
+    # ── Load TFLite model ──────────────────────────────────────────────────
+    state.interpreter = TFLiteInterpreter(model_path=TFLITE_PATH)
+    state.interpreter.allocate_tensors()
+    state.input_index  = state.interpreter.get_input_details()[0]["index"]
+    state.output_index = state.interpreter.get_output_details()[0]["index"]
+
+    # ── Load scaler + label encoder (still pickled, unchanged) ─────────────
     state.scaler = joblib.load(SCALER_PATH)
     state.le     = joblib.load(LE_PATH)
 
-    log.info("Model   loaded : %s  (%s)", MODEL_PATH,  type(state.model).__name__)
+    log.info("TFLite  loaded : %s", TFLITE_PATH)
     log.info("Scaler  loaded : %s", SCALER_PATH)
     log.info("Encoder loaded : %s  classes=%s", LE_PATH, list(state.le.classes_))
     log.info("CSV log path   : %s", os.path.abspath(CSV_LOG_PATH))
@@ -400,7 +433,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="DriveSense",
     description="Driving behaviour detection via IMU window classification (UART + HTTP)",
-    version="2.1.0",
+    version="3.0.0",
     lifespan=lifespan,
 )
 
@@ -455,7 +488,7 @@ async def root():
     return {
         "status":        "ok",
         "service":       "DriveSense",
-        "model":         type(state.model).__name__ if state.model else "not loaded",
+        "model":         "TFLite MLP" if state.interpreter else "not loaded",
         "classes":       CLASS_NAMES,
         "uart_enabled":  state.serial_conn is not None and state.serial_conn.is_open,
         "csv_log":       os.path.abspath(CSV_LOG_PATH),
@@ -465,7 +498,7 @@ async def root():
 
 @app.post("/predict", response_model=PredictResponse, summary="Classify a driving-behaviour window")
 async def predict(req: PredictRequest):
-    if state.model is None:
+    if state.interpreter is None:
         raise HTTPException(503, "Model not loaded")
 
     rows = [
